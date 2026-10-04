@@ -11,6 +11,7 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Stripe\Checkout\Session as StripeCheckoutSession;
+use Stripe\Exception\ApiErrorException;
 use Stripe\Exception\SignatureVerificationException;
 use Stripe\StripeClient;
 use Stripe\Webhook;
@@ -87,8 +88,8 @@ class PaymentController extends Controller
             'metadata' => [
                 'order_id' => (string) $order->id,
             ],
-            'success_url' => config('app.url') . '/api/orders/' . $order->id . '?stripe_status=success',
-            'cancel_url' => config('app.url') . '/api/orders/' . $order->id . '?stripe_status=cancel',
+            'success_url' => config('services.frontend.url') . '/checkout/success?order_id=' . $order->id,
+            'cancel_url' => config('services.frontend.url') . '/orders/' . $order->id . '?stripe_status=cancel',
         ]);
 
         Payment::updateOrCreate(
@@ -105,6 +106,63 @@ class PaymentController extends Controller
             'checkout_url' => $session->url,
             'session_id' => $session->id,
         ]);
+    }
+
+    #[OA\Post(
+        path: '/api/orders/{order}/sync-payment',
+        summary: 'Consultar a Stripe el estado del pago de una orden y actualizarlo',
+        description: 'Consulta la Checkout Session de Stripe asociada a la orden y sincroniza el estado local (pagada, fallida o sigue pendiente). Util cuando el webhook aun no llego. Solo el dueno de la orden puede consultarlo.',
+        security: [['sanctum' => []]],
+        tags: ['Payments'],
+        parameters: [
+            new OA\Parameter(name: 'order', in: 'path', required: true, description: 'ID de la orden', schema: new OA\Schema(type: 'integer')),
+        ],
+        responses: [
+            new OA\Response(response: 200, description: 'Orden con su estado actualizado', content: new OA\JsonContent(properties: [new OA\Property(property: 'data', ref: '#/components/schemas/Order')])),
+            new OA\Response(response: 401, description: 'No autenticado', content: new OA\JsonContent(ref: '#/components/schemas/ErrorMessage')),
+            new OA\Response(response: 403, description: 'La orden no pertenece al usuario', content: new OA\JsonContent(ref: '#/components/schemas/ErrorMessage')),
+            new OA\Response(response: 404, description: 'Orden no encontrada', content: new OA\JsonContent(ref: '#/components/schemas/ErrorMessage')),
+            new OA\Response(response: 422, description: 'La orden no tiene una sesion de pago iniciada', content: new OA\JsonContent(ref: '#/components/schemas/ErrorMessage')),
+            new OA\Response(response: 502, description: 'No se pudo consultar a Stripe', content: new OA\JsonContent(ref: '#/components/schemas/ErrorMessage')),
+        ]
+    )]
+    public function syncPayment(Request $request, Order $order): OrderResource|JsonResponse
+    {
+        if ($order->user_id !== $request->user()->id) {
+            return response()->json([
+                'message' => 'You are not authorized to check the payment of this order.',
+            ], 403);
+        }
+
+        if ($order->status !== 'paid') {
+            $payment = Payment::where('order_id', $order->id)->first();
+
+            if (! $payment || ! $payment->stripe_checkout_session_id) {
+                return response()->json([
+                    'message' => 'This order has no payment session yet.',
+                ], 422);
+            }
+
+            try {
+                $session = $this->stripe->checkout->sessions->retrieve($payment->stripe_checkout_session_id);
+            } catch (ApiErrorException $e) {
+                Log::warning('Stripe session lookup failed.', ['order_id' => $order->id, 'error' => $e->getMessage()]);
+
+                return response()->json([
+                    'message' => 'Could not retrieve the payment status from Stripe.',
+                ], 502);
+            }
+
+            if ($session->payment_status === 'paid') {
+                $this->markPaymentSucceeded($session);
+            } elseif ($session->status === 'expired') {
+                $this->markPaymentFailed($session);
+            }
+        }
+
+        $order->refresh()->load('items.product', 'payment');
+
+        return new OrderResource($order);
     }
 
     #[OA\Put(
