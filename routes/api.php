@@ -32,6 +32,7 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/orders/{order}', [OrderController::class, 'show']);
 
     Route::post('/orders/{order}/pay', [PaymentController::class, 'pay']);
+    Route::post('/orders/{order}/sync-payment', [PaymentController::class, 'syncPayment']);
     Route::put('/orders/{order}/mark-as-paid', [PaymentController::class, 'markAsPaid']);
 });
 
